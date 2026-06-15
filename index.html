@@ -1,0 +1,652 @@
+<!DOCTYPE html>
+<html lang="ko">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI 졸음 알리미</title>
+
+    <link rel="stylesheet" href="style.css" />
+
+    <!-- 버전 고정: @latest 사용 시 향후 호환성 문제가 발생할 수 있으므로 명시적 버전 지정 -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@teachablemachine/image@0.8.5/dist/teachablemachine-image.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/face_mesh.js"
+        crossorigin="anonymous"></script>
+</head>
+
+<body>
+    <div class="container">
+        <h1>AI 졸음 알리미</h1>
+
+        <p class="description">
+            웹캠 영상에서 눈 영역을 인식한 뒤, AI가 눈 뜸과 눈 감음을 판단합니다.
+        </p>
+
+        <div id="video-area">
+            <div id="webcam-container">
+                <p>시작 버튼을 누르면 카메라가 실행됩니다.</p>
+            </div>
+
+            <div id="eye-preview">
+                <span>AI 입력 눈 영역</span>
+                <canvas id="eye-canvas" width="224" height="224"></canvas>
+            </div>
+        </div>
+
+        <div id="result">현재 상태: 대기 중</div>
+        <div id="message">카메라 시작을 눌러주세요.</div>
+        <div id="probability"></div>
+
+        <button id="camera-btn" onclick="toggleCamera()">카메라 시작</button>
+
+        <p class="notice">
+            ※ 눈 감음 상태가 5초 이상 지속되면 알람이 울립니다.<br>
+            ※ 신뢰도 60% 이상일 때만 판정 결과를 반영합니다.
+        </p>
+    </div>
+
+    <script>
+        const MODEL_URL = "https://teachablemachine.withgoogle.com/models/aubfPBax9/";
+
+        let model;
+        let webcam;
+        let maxPredictions;
+
+        let faceMesh = null;
+        let latestLandmarks = null;
+
+        let closedStartTime = null;
+        let isCameraOn = false;
+        let animationId = null;
+
+        let alarmInterval = null;
+        let alarmAudioContext = null;
+        let isAlarmOn = false;
+        let alarmDismissed = false;
+        let lastTtsTime = 0;
+
+        let lastAnalyzedEye = "";
+
+        const DROWSY_TIME = 5000;
+
+        // 개선 1: 예측 신뢰도 임계값. 이 값 미만이면 상태를 갱신하지 않고 "판정 보류"로 표시
+        const CONFIDENCE_THRESHOLD = 0.6;
+
+        // 개선 2: 얼굴/눈 미검출 시 즉시 타이머를 리셋하지 않고 유지하는 허용 시간(ms)
+        const EYE_LOST_GRACE = 1000;
+        let lastEyeFoundTime = null;
+
+        const EYE_INPUT_SIZE = 224;
+        const eyeCanvas = document.getElementById("eye-canvas");
+        const eyeCtx = eyeCanvas.getContext("2d");
+
+        // 1순위 분석 대상 눈 (랜드마크 기준)
+        const PRIMARY_EYE_LANDMARK_INDICES = [
+            33, 7, 163, 144, 145, 153, 154, 155,
+            133, 173, 157, 158, 159, 160, 161, 246
+        ];
+
+        // 1순위가 안 잡히면 분석하는 보조 눈
+        const SECONDARY_EYE_LANDMARK_INDICES = [
+            263, 249, 390, 373, 374, 380, 381, 382,
+            362, 398, 384, 385, 386, 387, 388, 466
+        ];
+
+        clearEyePreview();
+
+        function withTimeout(promise, ms, name) {
+            return Promise.race([
+                promise,
+                new Promise((_, reject) =>
+                    setTimeout(() => reject(new Error(name + " 로딩 시간이 너무 오래 걸립니다.")), ms)
+                )
+            ]);
+        }
+
+        async function toggleCamera() {
+            if (isAlarmOn) {
+                stopAlarm();
+                document.getElementById("camera-btn").innerText = "카메라 끄기";
+                return;
+            }
+
+            if (isCameraOn) {
+                stopCamera();
+            } else {
+                await init();
+            }
+        }
+
+        async function init() {
+            const cameraBtn = document.getElementById("camera-btn");
+
+            try {
+                cameraBtn.disabled = true;
+                cameraBtn.innerText = "로딩 중...";
+
+                document.getElementById("result").innerText = "현재 상태: 대기 중";
+                document.getElementById("message").innerText =
+                    "티처블 머신 AI 모델을 불러오는 중입니다.";
+                document.getElementById("probability").innerText = "";
+
+                if (!model) {
+                    const modelURL = MODEL_URL + "model.json";
+                    const metadataURL = MODEL_URL + "metadata.json";
+
+                    model = await withTimeout(
+                        tmImage.load(modelURL, metadataURL),
+                        15000,
+                        "티처블 머신 모델"
+                    );
+
+                    maxPredictions = model.getTotalClasses();
+                }
+
+                document.getElementById("message").innerText =
+                    "눈 위치 인식 기능을 준비하는 중입니다.";
+
+                if (!faceMesh) {
+                    faceMesh = new FaceMesh({
+                        locateFile: function (file) {
+                            return "https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/" + file;
+                        }
+                    });
+
+                    faceMesh.setOptions({
+                        maxNumFaces: 1,
+                        refineLandmarks: false,
+                        minDetectionConfidence: 0.5,
+                        minTrackingConfidence: 0.5
+                    });
+
+                    faceMesh.onResults(onFaceMeshResults);
+                }
+
+                document.getElementById("message").innerText =
+                    "카메라 권한을 요청하는 중입니다.";
+
+                webcam = new tmImage.Webcam(640, 480, true);
+
+                await withTimeout(
+                    webcam.setup(),
+                    10000,
+                    "카메라"
+                );
+
+                await webcam.play();
+
+            } catch (error) {
+                console.error(error);
+
+                cameraBtn.disabled = false;
+                cameraBtn.innerText = "카메라 시작";
+
+                let errorMessage = "초기화에 실패했습니다.";
+
+                if (error.name === "NotAllowedError") {
+                    errorMessage = "카메라 권한이 차단되었습니다. 브라우저에서 카메라를 허용해주세요.";
+                } else if (error.name === "NotFoundError") {
+                    errorMessage = "카메라를 찾을 수 없습니다. 카메라 연결을 확인해주세요.";
+                } else if (error.name === "NotReadableError") {
+                    errorMessage = "다른 앱이 카메라를 사용 중일 수 있습니다. Zoom, Teams, 카메라 앱을 종료해주세요.";
+                } else if (error.name === "NotSecureError") {
+                    errorMessage = "보안 연결이 아니라 카메라를 사용할 수 없습니다. VS Code Live Server로 실행해주세요.";
+                } else {
+                    errorMessage = "오류 발생: " + error.message;
+                }
+
+                document.getElementById("message").innerText = errorMessage;
+                alert(errorMessage);
+
+                return;
+            }
+
+            const webcamContainer = document.getElementById("webcam-container");
+            webcamContainer.innerHTML = "";
+            webcamContainer.appendChild(webcam.canvas);
+
+            document.getElementById("eye-preview").style.display = "flex";
+            clearEyePreview();
+
+            isCameraOn = true;
+            alarmDismissed = false;
+            closedStartTime = null;
+            lastEyeFoundTime = null;
+
+            cameraBtn.disabled = false;
+            cameraBtn.innerText = "카메라 끄기";
+
+            document.getElementById("message").innerText = "분석을 시작합니다.";
+
+            animationId = window.requestAnimationFrame(loop);
+        }
+
+        function onFaceMeshResults(results) {
+            if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
+                latestLandmarks = results.multiFaceLandmarks[0];
+            } else {
+                latestLandmarks = null;
+            }
+        }
+
+        async function loop() {
+            if (!isCameraOn) {
+                return;
+            }
+
+            try {
+                webcam.update();
+
+                latestLandmarks = null;
+
+                await faceMesh.send({ image: webcam.canvas });
+
+                if (!isCameraOn) {
+                    return;
+                }
+
+                let eyeFound = false;
+
+                if (latestLandmarks !== null) {
+                    if (cropOneEyeRegion(webcam.canvas, latestLandmarks, PRIMARY_EYE_LANDMARK_INDICES, "주요 눈 영역")) {
+                        eyeFound = true;
+                        await predict(eyeCanvas);
+                    } else if (cropOneEyeRegion(webcam.canvas, latestLandmarks, SECONDARY_EYE_LANDMARK_INDICES, "보조 눈 영역")) {
+                        eyeFound = true;
+                        await predict(eyeCanvas);
+                    }
+                }
+
+                if (eyeFound) {
+                    lastEyeFoundTime = Date.now();
+                } else {
+                    clearEyePreview();
+                    handleEyeNotDetected();
+                }
+
+            } catch (error) {
+                console.error(error);
+
+                clearEyePreview();
+                handleEyeNotDetected();
+
+                document.getElementById("probability").innerText =
+                    "눈 위치 분석 준비 중";
+            }
+
+            if (!isCameraOn) {
+                return;
+            }
+
+            animationId = window.requestAnimationFrame(loop);
+        }
+
+        // 개선 2: 눈 미검출 시 즉시 타이머를 리셋하지 않고,
+        // 일정 시간(EYE_LOST_GRACE) 동안은 직전 상태(눈 감음 누적 시간)를 유지
+        function handleEyeNotDetected() {
+            const now = Date.now();
+            const lostDuration = lastEyeFoundTime === null ? Infinity : now - lastEyeFoundTime;
+
+            if (closedStartTime !== null && lostDuration <= EYE_LOST_GRACE) {
+                document.getElementById("probability").innerText =
+                    "눈 위치 미검출 (직전 상태 유지 중)";
+                showClosedState(true);
+                return;
+            }
+
+            showEyeNotDetectedState();
+            document.getElementById("probability").innerText = "눈 위치 미검출";
+        }
+
+        function cropOneEyeRegion(sourceCanvas, landmarks, eyeIndices, eyeName) {
+            const w = sourceCanvas.width;
+            const h = sourceCanvas.height;
+
+            let minX = 1;
+            let minY = 1;
+            let maxX = 0;
+            let maxY = 0;
+            let validPointCount = 0;
+
+            for (let i = 0; i < eyeIndices.length; i++) {
+                const point = landmarks[eyeIndices[i]];
+
+                if (!point) {
+                    continue;
+                }
+
+                if (point.x < 0 || point.x > 1 || point.y < 0 || point.y > 1) {
+                    continue;
+                }
+
+                validPointCount++;
+
+                if (point.x < minX) minX = point.x;
+                if (point.y < minY) minY = point.y;
+                if (point.x > maxX) maxX = point.x;
+                if (point.y > maxY) maxY = point.y;
+            }
+
+            if (validPointCount < 6) {
+                return false;
+            }
+
+            if (maxX <= minX || maxY <= minY) {
+                return false;
+            }
+
+            let x1 = minX * w;
+            let x2 = maxX * w;
+            let y1 = minY * h;
+            let y2 = maxY * h;
+
+            const eyeWidth = x2 - x1;
+            const eyeHeight = y2 - y1;
+
+            // 개선 5: 고정 픽셀값 대신 캔버스 크기에 비례한 임계값 사용
+            const minWidth = w * 0.028;
+            const minHeight = h * 0.01;
+
+            if (eyeWidth < minWidth || eyeHeight < minHeight) {
+                return false;
+            }
+
+            const centerX = (x1 + x2) / 2;
+            const centerY = (y1 + y2) / 2;
+
+            const cropWidth = eyeWidth * 2.6;
+            const cropHeight = eyeWidth * 1.55;
+
+            let sx = centerX - cropWidth / 2;
+            let sy = centerY - cropHeight / 2;
+
+            if (sx < -cropWidth * 0.25 || sy < -cropHeight * 0.25 ||
+                sx + cropWidth > w + cropWidth * 0.25 ||
+                sy + cropHeight > h + cropHeight * 0.25) {
+                return false;
+            }
+
+            sx = Math.max(0, Math.min(sx, w - cropWidth));
+            sy = Math.max(0, Math.min(sy, h - cropHeight));
+
+            eyeCtx.clearRect(0, 0, EYE_INPUT_SIZE, EYE_INPUT_SIZE);
+
+            eyeCtx.fillStyle = "#dddddd";
+            eyeCtx.fillRect(0, 0, EYE_INPUT_SIZE, EYE_INPUT_SIZE);
+
+            eyeCtx.imageSmoothingEnabled = true;
+            eyeCtx.imageSmoothingQuality = "high";
+
+            eyeCtx.drawImage(
+                sourceCanvas,
+                sx, sy, cropWidth, cropHeight,
+                0, 0, EYE_INPUT_SIZE, EYE_INPUT_SIZE
+            );
+
+            lastAnalyzedEye = eyeName;
+
+            return true;
+        }
+
+        function clearEyePreview() {
+            eyeCtx.fillStyle = "#dddddd";
+            eyeCtx.fillRect(0, 0, EYE_INPUT_SIZE, EYE_INPUT_SIZE);
+            lastAnalyzedEye = "";
+        }
+
+        async function predict(inputCanvas) {
+            const prediction = await model.predict(inputCanvas);
+
+            let topIndex = 0;
+
+            for (let i = 1; i < prediction.length; i++) {
+                if (prediction[i].probability > prediction[topIndex].probability) {
+                    topIndex = i;
+                }
+            }
+
+            const topProbability = prediction[topIndex].probability;
+
+            document.getElementById("probability").innerText =
+                "분석 영역: " + lastAnalyzedEye + " / 예측 확률: " + (topProbability * 100).toFixed(1) + "%";
+
+            // 개선 1: 신뢰도가 임계값 미만이면 상태를 갱신하지 않음
+            if (topProbability < CONFIDENCE_THRESHOLD) {
+                document.getElementById("message").innerText =
+                    "신뢰도 부족 - 판정 보류 중 (" + (topProbability * 100).toFixed(0) + "%)";
+                return;
+            }
+
+            if (topIndex === 0) {
+                showOpenState();
+            } else if (topIndex === 1) {
+                showClosedState(false);
+            }
+        }
+
+        function stopCamera() {
+            isCameraOn = false;
+
+            if (animationId !== null) {
+                window.cancelAnimationFrame(animationId);
+                animationId = null;
+            }
+
+            if (webcam) {
+                webcam.stop();
+            }
+
+            stopAlarm();
+
+            const webcamContainer = document.getElementById("webcam-container");
+            webcamContainer.innerHTML = "<p>시작 버튼을 누르면 카메라가 실행됩니다.</p>";
+
+            document.getElementById("eye-preview").style.display = "none";
+            clearEyePreview();
+            latestLandmarks = null;
+
+            document.getElementById("camera-btn").innerText = "카메라 시작";
+            document.getElementById("camera-btn").disabled = false;
+
+            document.getElementById("result").innerText = "현재 상태: 대기 중";
+            document.getElementById("message").innerText = "카메라 시작을 눌러주세요.";
+            document.getElementById("probability").innerText = "";
+
+            document.body.style.backgroundColor = "#e8f5e9";
+
+            closedStartTime = null;
+            lastEyeFoundTime = null;
+            alarmDismissed = false;
+            resetAlertStyle();
+        }
+
+        function resetAlertStyle() {
+            document.getElementById("result").classList.remove("sleep-alert");
+        }
+
+        function showOpenState() {
+    // 알람이 울리는 중이면 눈뜸이 인식되어도 알람 화면을 유지
+    if (isAlarmOn) {
+        document.body.style.backgroundColor = "#ffebee";
+
+        document.getElementById("result").innerText = "자는중!!";
+        document.getElementById("result").classList.add("sleep-alert");
+
+        document.getElementById("message").innerText =
+            "알람이 울리는 중입니다. 알람 끄기 버튼을 눌러주세요.";
+
+        document.getElementById("camera-btn").innerText = "알람 끄기";
+
+        return;
+    }
+
+    resetAlertStyle();
+
+    document.body.style.backgroundColor = "#e8f5e9";
+    document.getElementById("result").innerText = "현재 상태: 눈 뜸";
+    document.getElementById("message").innerText = "깨어 있는 상태입니다.";
+
+    alarmDismissed = false;
+    closedStartTime = null;
+}
+
+        // fromGracePeriod: 눈 미검출이지만 유예 시간 내라서 상태를 유지하는 호출인지 여부
+        function showClosedState(fromGracePeriod) {
+            document.body.style.backgroundColor = "#fff3e0";
+
+            if (!fromGracePeriod) {
+                document.getElementById("result").innerText = "현재 상태: 눈 감음";
+            }
+
+            if (closedStartTime === null) {
+                closedStartTime = Date.now();
+                alarmDismissed = false;
+            }
+
+            const closedDuration = Date.now() - closedStartTime;
+            const closedSeconds = Math.floor(closedDuration / 1000);
+
+            if (closedDuration >= DROWSY_TIME) {
+                document.body.style.backgroundColor = "#ffebee";
+
+                document.getElementById("result").innerText = "자는중!!";
+                document.getElementById("result").classList.add("sleep-alert");
+
+                if (alarmDismissed) {
+                    document.getElementById("message").innerText =
+                        "알람이 해제되었습니다. 눈을 뜨면 다시 감지됩니다.";
+                } else {
+                    document.getElementById("message").innerText =
+                        "눈 감음 상태가 5초 이상 지속되었습니다. 알람 끄기 버튼을 눌러주세요.";
+
+                    startAlarm();
+                }
+            } else {
+                resetAlertStyle();
+
+                if (!fromGracePeriod) {
+                    document.getElementById("message").innerText =
+                        "눈 감음 상태가 감지되었습니다. " + closedSeconds + "초";
+                }
+            }
+        }
+
+        function showEyeNotDetectedState() {
+    // 알람이 울리는 중이면 눈 인식 안 됨이 떠도 알람 화면 유지
+    if (isAlarmOn) {
+        document.body.style.backgroundColor = "#ffebee";
+
+        document.getElementById("result").innerText = "자는중!!";
+        document.getElementById("result").classList.add("sleep-alert");
+
+        document.getElementById("message").innerText =
+            "알람이 울리는 중입니다. 알람 끄기 버튼을 눌러주세요.";
+
+        document.getElementById("camera-btn").innerText = "알람 끄기";
+
+        return;
+    }
+
+    resetAlertStyle();
+
+    document.body.style.backgroundColor = "#eeeeee";
+    document.getElementById("result").innerText = "현재 상태: 눈 인식 안 됨";
+
+    document.getElementById("message").innerText =
+        "눈이 잘 보이도록 얼굴을 카메라 중앙에 맞춰주세요.";
+
+    alarmDismissed = false;
+    closedStartTime = null;
+}
+
+        function startAlarm() {
+            if (isAlarmOn) {
+                return;
+            }
+
+            isAlarmOn = true;
+
+            const cameraBtn = document.getElementById("camera-btn");
+            cameraBtn.innerText = "알람 끄기";
+
+            speakTTS("자는 중입니다. 일어나세요.");
+            playAlarmSound();
+
+            alarmInterval = setInterval(function () {
+                playAlarmSound();
+                speakTTS("자는 중입니다. 일어나세요.");
+            }, 2000);
+        }
+
+        function stopAlarm() {
+            if (!isAlarmOn) {
+                return;
+            }
+
+            isAlarmOn = false;
+            alarmDismissed = true;
+
+            if (alarmInterval !== null) {
+                clearInterval(alarmInterval);
+                alarmInterval = null;
+            }
+
+            window.speechSynthesis.cancel();
+
+            const cameraBtn = document.getElementById("camera-btn");
+
+            if (isCameraOn) {
+                cameraBtn.innerText = "카메라 끄기";
+                document.getElementById("message").innerText = "알람이 해제되었습니다.";
+            } else {
+                cameraBtn.innerText = "카메라 시작";
+            }
+        }
+
+        function playAlarmSound() {
+            if (!alarmAudioContext) {
+                alarmAudioContext = new (window.AudioContext || window.webkitAudioContext)();
+            }
+
+            const oscillator = alarmAudioContext.createOscillator();
+            const gainNode = alarmAudioContext.createGain();
+
+            oscillator.connect(gainNode);
+            gainNode.connect(alarmAudioContext.destination);
+
+            oscillator.frequency.value = 900;
+            oscillator.type = "sine";
+
+            gainNode.gain.setValueAtTime(0.25, alarmAudioContext.currentTime);
+            gainNode.gain.exponentialRampToValueAtTime(
+                0.01,
+                alarmAudioContext.currentTime + 0.4
+            );
+
+            oscillator.start();
+            oscillator.stop(alarmAudioContext.currentTime + 0.4);
+        }
+
+        function speakTTS(text) {
+            const now = Date.now();
+
+            if (now - lastTtsTime < 1800) {
+                return;
+            }
+
+            lastTtsTime = now;
+
+            window.speechSynthesis.cancel();
+
+            const utterance = new SpeechSynthesisUtterance(text);
+            utterance.lang = "ko-KR";
+            utterance.rate = 1;
+            utterance.pitch = 1;
+            utterance.volume = 1;
+
+            window.speechSynthesis.speak(utterance);
+        }
+    </script>
+</body>
+</html>
